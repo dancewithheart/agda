@@ -46,8 +46,9 @@ readAtomic = liftIO . readMVar . unAtomic
 {-# INLINE readAtomic #-}
 
 -- | Modify the contents of an atomic variable. If the continuation
--- fails, or receives an asynchronous exception, the variable is
--- returned to its old state.
+-- fails, aborts through a monad transformer, or receives an asynchronous
+-- exception, the variable is returned to its old state. This also applies
+-- if evaluating the new state fails.
 --
 -- No thread, *including the calling thread*, can access the contents of
 -- the same 'Atomic' while this function is executing, for reading *or*
@@ -63,11 +64,18 @@ readAtomic = liftIO . readMVar . unAtomic
 -- will result in a deadlock. The new state of the variable is evaluated
 -- (to WHNF).
 modifyAtomic :: (MonadIO m, MonadMask m) => Atomic a -> (a -> m (a, b)) -> m b
-modifyAtomic (Atomic var) k = mask \restore -> do
-  old <- liftIO $ takeMVar var
-  (new, ret) <- restore (k old >>= liftIO . evaluate)
-    `onException` liftIO (putMVar var old)
-  ret <$ liftIO (putMVar var $! new)
+modifyAtomic (Atomic var) k = do
+  ((_, ret), ()) <- generalBracket
+    (liftIO $ takeMVar var)
+    (\old result -> liftIO $ putMVar var $ case result of
+      ExitCaseSuccess (new, _) -> new
+      _                       -> old)
+    (\old -> do
+      result@(new, _) <- k old
+      -- Forcing the new state is part of the update, and can fail too.
+      _ <- liftIO $ evaluate new
+      pure result)
+  pure ret
 
 {-# SPECIALISE modifyAtomic :: Atomic a -> (a -> IO (a, b)) -> IO b #-}
 
